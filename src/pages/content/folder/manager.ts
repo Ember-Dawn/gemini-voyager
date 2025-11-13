@@ -51,9 +51,12 @@ export class FolderManager {
   private multiSelectFolderId: string | null = null; // Track which folder multi-select was initiated from
   private longPressTimeout: number | null = null; // For long-press detection
   private longPressThreshold: number = 500; // Long-press duration in ms
+  private folderEnabled: boolean = true; // Whether folder feature is enabled
   private hideArchivedConversations: boolean = false; // Whether to hide conversations in folders
   private navPoller: number | null = null;
   private lastPathname: string | null = null;
+  private saveInProgress: boolean = false; // Lock to prevent concurrent saves
+  private pendingTitleUpdates: Map<string, string> = new Map(); // Buffer title updates during render
 
   constructor() {
     this.loadData();
@@ -66,46 +69,60 @@ export class FolderManager {
 
   async init(): Promise<void> {
     try {
+      // Load folder enabled setting
+      await this.loadFolderEnabledSetting();
+
       // Load hide archived setting
       await this.loadHideArchivedSetting();
 
-      // Set up storage change listener
+      // Set up storage change listener (always needed to respond to setting changes)
       this.setupStorageListener();
 
-      // Wait for sidebar to be available
-      await this.waitForSidebar();
-
-      // Find the Recent section
-      this.findRecentSection();
-
-      if (!this.recentSection) {
-        this.debugWarn('Could not find Recent section');
+      // If folder feature is disabled, skip initialization
+      if (!this.folderEnabled) {
+        this.debug('Folder feature is disabled, skipping initialization');
         return;
       }
 
-      // Create and inject folder UI
-      this.createFolderUI();
-
-      // Make conversations draggable
-      this.makeConversationsDraggable();
-
-      // Set up mutation observer to handle dynamically added conversations
-      this.setupMutationObserver();
-
-      // Set up sidebar visibility observer
-      this.setupSideNavObserver();
-
-      // Initial visibility check
-      this.updateVisibilityBasedOnSideNav();
-
-      // Set up native conversation menu injection
-      this.setupConversationClickTracking();
-      this.setupNativeConversationMenuObserver();
+      // Initialize folder UI
+      await this.initializeFolderUI();
 
       this.debug('Initialized successfully');
     } catch (error) {
       console.error('[FolderManager] Initialization error:', error);
     }
+  }
+
+  private async initializeFolderUI(): Promise<void> {
+    // Wait for sidebar to be available
+    await this.waitForSidebar();
+
+    // Find the Recent section
+    this.findRecentSection();
+
+    if (!this.recentSection) {
+      this.debugWarn('Could not find Recent section');
+      return;
+    }
+
+    // Create and inject folder UI
+    this.createFolderUI();
+
+    // Make conversations draggable
+    this.makeConversationsDraggable();
+
+    // Set up mutation observer to handle dynamically added conversations
+    this.setupMutationObserver();
+
+    // Set up sidebar visibility observer
+    this.setupSideNavObserver();
+
+    // Initial visibility check
+    this.updateVisibilityBasedOnSideNav();
+
+    // Set up native conversation menu injection
+    this.setupConversationClickTracking();
+    this.setupNativeConversationMenuObserver();
   }
 
   private async waitForSidebar(): Promise<void> {
@@ -187,6 +204,9 @@ export class FolderManager {
     this.highlightActiveConversationInFolders();
     this.installRouteChangeListener();
     this.installSidebarClickListener();
+
+    // Apply initial folder enabled setting
+    this.applyFolderEnabledSetting();
   }
 
   private createMultiSelectIndicator(): HTMLElement {
@@ -422,8 +442,9 @@ export class FolderManager {
       if (syncedTitle && syncedTitle !== conv.title) {
         conv.title = syncedTitle;
         displayTitle = syncedTitle;
-        this.saveData();
-        this.debug('Updated conversation title from native:', syncedTitle);
+        // Buffer title updates during render to avoid multiple rapid saves
+        this.pendingTitleUpdates.set(conv.conversationId, syncedTitle);
+        this.debug('Buffered title update for:', conv.conversationId);
       }
     }
 
@@ -1518,6 +1539,7 @@ export class FolderManager {
       return;
     }
 
+    // Save immediately before refresh to persist data
     this.saveData();
     this.refresh();
   }
@@ -1576,6 +1598,7 @@ export class FolderManager {
       });
     }
 
+    // Save immediately before refresh to persist data
     this.saveData();
     this.refresh();
   }
@@ -2076,7 +2099,8 @@ export class FolderManager {
     // Helper function to add folder options recursively
     const addFolderOptions = (parentId: string | null, level: number = 0) => {
       const folders = this.data.folders.filter((f) => f.parentId === parentId);
-      folders.forEach((folder) => {
+      const sortedFolders = this.sortFolders(folders); // Apply same sorting as sidebar
+      sortedFolders.forEach((folder) => {
         const folderItem = document.createElement('button');
         folderItem.className = 'gv-folder-dialog-item';
         folderItem.style.paddingLeft = `${level * 16 + 12}px`;
@@ -2891,6 +2915,19 @@ export class FolderManager {
 
     // Update active highlight after re-render
     this.highlightActiveConversationInFolders();
+
+    // Flush any pending title updates collected during rendering
+    if (this.pendingTitleUpdates.size > 0) {
+      this.debug(`Flushing ${this.pendingTitleUpdates.size} pending title updates`);
+      // Save once after all title updates are applied
+      const saved = this.saveData();
+      // Only clear after confirmed successful save to avoid losing updates
+      if (saved) {
+        this.pendingTitleUpdates.clear();
+      } else {
+        this.debugWarn('Save failed, retaining pending title updates for next attempt');
+      }
+    }
   }
 
   private getCurrentHexIdFromLocation(): string | null {
@@ -2914,22 +2951,115 @@ export class FolderManager {
     });
   }
 
+  /**
+   * Ensures data integrity by validating and repairing the folder data structure.
+   * This method is called by both loadData() and saveData() to maintain consistency.
+   */
+  private ensureDataIntegrity(): void {
+    // Ensure folderContents object exists
+    if (!this.data.folderContents) {
+      this.data.folderContents = {};
+      this.debugWarn('folderContents was missing, initialized');
+    }
+
+    // Ensure folders array exists
+    if (!this.data.folders) {
+      this.data.folders = [];
+      this.debugWarn('folders was missing, initialized');
+    }
+
+    // Ensure all folders have a folderContents entry (even if empty)
+    // This is critical for empty folders to persist correctly
+    this.data.folders.forEach((folder) => {
+      if (!this.data.folderContents[folder.id]) {
+        this.data.folderContents[folder.id] = [];
+        this.debugWarn(`Initialized missing folderContents for folder: ${folder.name}`);
+      }
+    });
+  }
+
   private loadData(): void {
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
         this.data = JSON.parse(stored);
+
+        // Validate and repair data integrity
+        this.ensureDataIntegrity();
+
+        // Clean up orphaned folderContents (folders that no longer exist)
+        const validFolderIds = new Set(this.data.folders.map(f => f.id));
+        validFolderIds.add(ROOT_CONVERSATIONS_ID); // Keep root conversations
+        Object.keys(this.data.folderContents).forEach((folderId) => {
+          if (!validFolderIds.has(folderId)) {
+            this.debugWarn(`Removing orphaned folderContents for: ${folderId}`);
+            delete this.data.folderContents[folderId];
+          }
+        });
+
+        this.debug('Data loaded and validated successfully');
       }
     } catch (error) {
       console.error('[FolderManager] Load data error:', error);
+      // Reset to default on error
+      this.data = { folders: [], folderContents: {} };
     }
   }
 
-  private saveData(): void {
+  private saveData(): boolean {
+    // Prevent concurrent saves to avoid race conditions
+    if (this.saveInProgress) {
+      this.debug('Save already in progress, skipping duplicate call');
+      return false;
+    }
+
+    this.saveInProgress = true;
+    let success = false;
+
+    // Centralized save logic to avoid duplication
+    const attemptSave = (): void => {
+      // Validate data integrity before saving
+      this.ensureDataIntegrity();
+
+      const dataString = JSON.stringify(this.data);
+      localStorage.setItem(STORAGE_KEY, dataString);
+
+      // Verify the save was successful by reading back
+      const verification = localStorage.getItem(STORAGE_KEY);
+      if (verification !== dataString) {
+        throw new Error('Save verification failed - data mismatch');
+      }
+    };
+
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
+      attemptSave();
+      this.debug('Data saved and verified successfully');
+      success = true;
     } catch (error) {
-      console.error('[FolderManager] Save data error:', error);
+      console.error('[FolderManager] Save data error, retrying once:', error);
+      // Attempt retry once on error
+      try {
+        attemptSave();
+        this.debug('Retry save successful and verified');
+        success = true;
+      } catch (retryError) {
+        console.error('[FolderManager] Retry save failed:', retryError);
+      }
+    } finally {
+      this.saveInProgress = false;
+    }
+
+    return success;
+  }
+
+  private async loadFolderEnabledSetting(): Promise<void> {
+    try {
+      const result = await browser.storage.sync.get({ geminiFolderEnabled: true });
+      this.folderEnabled = result.geminiFolderEnabled !== false;
+      this.debug('Loaded folder enabled setting:', this.folderEnabled);
+    } catch (error) {
+      console.error('[FolderManager] Failed to load folder enabled setting:', error);
+      this.folderEnabled = true;
     }
   }
 
@@ -2946,13 +3076,43 @@ export class FolderManager {
 
   private setupStorageListener(): void {
     browser.storage.onChanged.addListener((changes, areaName) => {
-      if (areaName === 'sync' && changes.geminiFolderHideArchivedConversations) {
-        this.hideArchivedConversations = !!changes.geminiFolderHideArchivedConversations.newValue;
-        this.debug('Hide archived setting changed:', this.hideArchivedConversations);
-        // Apply the change to all conversations
-        this.applyHideArchivedSetting();
+      if (areaName === 'sync') {
+        if (changes.geminiFolderEnabled) {
+          this.folderEnabled = changes.geminiFolderEnabled.newValue !== false;
+          this.debug('Folder enabled setting changed:', this.folderEnabled);
+          // Apply the change to folder visibility
+          this.applyFolderEnabledSetting();
+        }
+        if (changes.geminiFolderHideArchivedConversations) {
+          this.hideArchivedConversations = !!changes.geminiFolderHideArchivedConversations.newValue;
+          this.debug('Hide archived setting changed:', this.hideArchivedConversations);
+          // Apply the change to all conversations
+          this.applyHideArchivedSetting();
+        }
       }
     });
+  }
+
+  private applyFolderEnabledSetting(): void {
+    if (this.folderEnabled) {
+      // If folder UI doesn't exist yet, initialize it
+      if (!this.containerElement) {
+        this.debug('Folder feature enabled, initializing UI');
+        this.initializeFolderUI().catch((error) => {
+          console.error('[FolderManager] Failed to initialize folder UI:', error);
+        });
+      } else {
+        // UI already exists, just show it
+        this.containerElement.style.display = '';
+        this.debug('Folder feature enabled');
+      }
+    } else {
+      // Hide the folder UI if it exists
+      if (this.containerElement) {
+        this.containerElement.style.display = 'none';
+        this.debug('Folder feature disabled');
+      }
+    }
   }
 
   private applyHideArchivedSetting(): void {
